@@ -30,6 +30,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <fstream>
+
 // The key generator
 template <typename T, typename set_hasher = MurmurHash3_32<T>>
 class KeyGenerator {
@@ -228,10 +230,12 @@ int main(int argc, char** argv) {
 
   // Host side buffers shared between threads
   key_type* h_keys;  // Buffer holding all keys in embedding table
+  key_type* h_lookup_keys; // Buffer holding all lookup keys in embedding table
   float* h_vals;     // Buffer holding all values in embedding table
 
   // host-only buffers placed in normal host memory
   h_keys = (key_type*)malloc(emb_size * sizeof(key_type));
+  h_lookup_keys = (key_type*)malloc(iter_round * query_length * num_threads * sizeof(key_type));
   h_vals = (float*)malloc(emb_size * embedding_vec_size * sizeof(float));
 
   // The empty key to be used
@@ -266,7 +270,31 @@ int main(int argc, char** argv) {
 
   std::cout << "Filling data" << std::endl;
   // Generating random unique keys
-  gen_key.fill_unique(h_keys, emb_size, empty_key);
+
+  std::ifstream ifs;
+	ifs.open("/HugeCTR/raw_sample_ad_feature/restore_keys.txt");
+	for(size_t i = 0; i < emb_size; i++){
+		ifs >> h_keys[i];
+	}
+	ifs.close();
+
+  // gen_key.fill_unique(h_keys, emb_size, empty_key);
+
+  std::ifstream lookup_keys_stream;
+	lookup_keys_stream.open("/HugeCTR/raw_sample_ad_feature/lookup_keys.txt");
+	for(size_t i = 0; i < iter_round * query_length * num_threads; i++){
+		lookup_keys_stream >> h_lookup_keys[i];
+	}
+	lookup_keys_stream.close();
+
+  for(size_t i = 0; i < 10;i++){
+    std::cout << h_keys[i] << std::endl;
+  }
+
+  for(size_t i = 0; i < 10;i++){
+    std::cout << h_lookup_keys[i] << std::endl;
+  }
+  
   // Filling values vector according to the keys
   fill_vec(h_keys, h_vals, embedding_vec_size, emb_size, increase);
 
@@ -296,7 +324,7 @@ int main(int argc, char** argv) {
 
 #pragma omp parallel default(none)                                                           \
     shared(h_keys, cache, h_emb_table, increase, embedding_vec_size, query_length, emb_size, \
-           iter_round, std::cout, cache_type) num_threads(num_threads)
+           iter_round, std::cout, cache_type, h_lookup_keys) num_threads(num_threads)
   {
     // The thread ID for this thread
     int thread_id = omp_get_thread_num();
@@ -373,10 +401,10 @@ int main(int argc, char** argv) {
     printf("Worker %d : normal distribution test start.\n", thread_id);
     for (size_t i = 0; i < iter_round; i++) {
       // Generate random index with normal-distribution
-      normal_gen.fill_unique(h_query_keys_index, query_length, 0, foot_print);
+      //normal_gen.fill_unique(h_query_keys_index, query_length, 0, foot_print);
       // Select keys from total keys buffer with the index
       for (size_t j = 0; j < query_length; j++) {
-        h_query_keys[j] = h_keys[h_query_keys_index[j]];
+        h_query_keys[j] = h_lookup_keys[i * query_length + j];
         // std::cout << h_query_keys[j] << " ";
       }
       std::cout << std::endl;
