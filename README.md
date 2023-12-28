@@ -11,6 +11,8 @@ Design Goals:
 * **Easy**: Regardless of whether you are a data scientist or machine learning practitioner, we've made it easy for anybody to use HugeCTR with plenty of [documents](https://nvidia-merlin.github.io/HugeCTR/main/hugectr_user_guide.html), [notebooks](https://github.com/NVIDIA-Merlin/HugeCTR/tree/main/notebooks) and [samples](https://github.com/NVIDIA-Merlin/HugeCTR/tree/main/samples).
 * **Domain Specific**: HugeCTR provides the [essentials](https://github.com/NVIDIA-Merlin/HugeCTR#core-features), so that you can efficiently deploy your recommender models with very large embedding.
 
+**NOTE**: If you have any questions in using HugeCTR, please file an issue or join our [Slack channel](https://join.slack.com/t/hugectr/shared_invite/zt-29fptzv4w-s4bA3TkDn54YEHLKIS4Qsw) to have more interactive discussions. 
+
 ## Table of Contents
 * [Core Features](https://nvidia-merlin.github.io/HugeCTR/main/hugectr_core_features.html)
 * [Getting Started](https://nvidia-merlin.github.io/HugeCTR/main/hugectr_user_guide.html#installing-and-building-hugectr)
@@ -42,7 +44,7 @@ If you'd like to quickly train a model using the Python interface, do the follow
 
 1. Start a NGC container with your local host directory (/your/host/dir mounted) by running the following command:
    ```
-   docker run --gpus=all --rm -it --cap-add SYS_NICE -v /your/host/dir:/your/container/dir -w /your/container/dir -it -u $(id -u):$(id -g) nvcr.io/nvidia/merlin/merlin-hugectr:23.09
+   docker run --gpus=all --rm -it --cap-add SYS_NICE -v /your/host/dir:/your/container/dir -w /your/container/dir -it -u $(id -u):$(id -g) nvcr.io/nvidia/merlin/merlin-hugectr:23.12
    ```
 
    **NOTE**: The **/your/host/dir** directory is just as visible as the **/your/container/dir** directory. The **/your/host/dir** directory is also your starting directory.

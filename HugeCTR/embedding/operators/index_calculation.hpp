@@ -120,6 +120,11 @@ struct SegmentedSortDevice {
   core23::Tensor d_num_selected_table_range_;
   core23::Tensor temp_lookup_range;
 
+  // The following two members are used when cub version >= 200200.
+  // CUB_VERSION is defined in cuh so do not use it here.
+  core23::Tensor compose_tid_keys_input;
+  core23::Tensor compose_tid_keys_output;
+
   core23::Tensor partitioned_table_range;
 
   core23::Tensor sorted_table_ids_;

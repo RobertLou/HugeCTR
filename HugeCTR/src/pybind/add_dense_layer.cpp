@@ -26,8 +26,6 @@
 #include <layers/fm_order2_layer.hpp>
 #include <layers/fully_connected_layer.hpp>
 #include <layers/fully_connected_layer_half.hpp>
-#include <layers/fused_fully_connected_layer.hpp>
-#include <layers/fused_relu_bias_fully_connected_layer.hpp>
 #include <layers/fused_reshape_concat_general_layer.hpp>
 #include <layers/fused_reshape_concat_layer.hpp>
 #include <layers/gather_layer.hpp>
@@ -285,22 +283,6 @@ void save_graph_to_json(nlohmann::json& layer_config_array,
         layer_config["transpose_b"] = dense_layer_params[i].transpose_b;
         break;
       }
-      case Layer_t::FusedInnerProduct: {
-        nlohmann::json fc_param_config;
-        fc_param_config["num_output"] = dense_layer_params[i].num_output;
-        if (dense_layer_params[i].weight_init_type != Initializer_t::Default) {
-          fc_param_config["weight_init"] =
-              INITIALIZER_TYPE_TO_STRING[dense_layer_params[i].weight_init_type];
-        }
-        if (dense_layer_params[i].bias_init_type != Initializer_t::Default) {
-          fc_param_config["bias_init"] =
-              INITIALIZER_TYPE_TO_STRING[dense_layer_params[i].bias_init_type];
-        }
-        layer_config["position"] = FC_POSITION_TO_STRING[dense_layer_params[i].pos_type];
-        layer_config["activation"] = FC_ACTIVATION_TO_STRING[dense_layer_params[i].act_type];
-        layer_config["fc_param"] = fc_param_config;
-        break;
-      }
       case Layer_t::MLP: {
         nlohmann::json mlp_param_config;
         mlp_param_config["num_output"] = dense_layer_params[i].num_output;
@@ -550,49 +532,6 @@ DenseLayer get_dense_layer_from_json(const nlohmann::json& j_dense_layer) {
       auto max_sequence_len_to = get_json(j_dense_layer, "max_sequence_len_to");
       dense_layer.max_sequence_len_from = max_sequence_len_from;
       dense_layer.max_sequence_len_to = max_sequence_len_to;
-      break;
-    }
-    case Layer_t::FusedInnerProduct: {
-      auto j_fc_param = get_json(j_dense_layer, "fc_param");
-      if (has_key_(j_fc_param, "weight_init")) {
-        const auto weight_init_name = get_value_from_json<std::string>(j_fc_param, "weight_init");
-        Initializer_t weight_init_type;
-        if (find_item_in_map(weight_init_type, weight_init_name, INITIALIZER_TYPE_MAP)) {
-          dense_layer.weight_init_type = weight_init_type;
-        } else {
-          HCTR_OWN_THROW(Error_t::WrongInput, "No such initializer: " + weight_init_name);
-        }
-      }
-      if (has_key_(j_fc_param, "bias_init")) {
-        const auto bias_init_name = get_value_from_json<std::string>(j_fc_param, "bias_init");
-        Initializer_t bias_init_type;
-        if (find_item_in_map(bias_init_type, bias_init_name, INITIALIZER_TYPE_MAP)) {
-          dense_layer.bias_init_type = bias_init_type;
-        } else {
-          HCTR_OWN_THROW(Error_t::WrongInput, "No such initializer: " + bias_init_name);
-        }
-      }
-      if (has_key_(j_dense_layer, "position")) {
-        const auto position_name = get_value_from_json<std::string>(j_dense_layer, "position");
-        FcPosition_t pos_type;
-        if (find_item_in_map(pos_type, position_name, FCPOSITION_TYPE_MAP)) {
-          dense_layer.pos_type = pos_type;
-        } else {
-          HCTR_OWN_THROW(Error_t::WrongInput, "No such position: " + position_name);
-        }
-      }
-      if (has_key_(j_dense_layer, "activation")) {
-        const auto act_name = get_value_from_json<std::string>(j_dense_layer, "activation");
-        Activation_t act_type = Activation_t::Relu;
-        if (find_item_in_map(act_type, act_name, ACTIVATION_TYPE_MAP)) {
-          dense_layer.act_type = act_type;
-        } else {
-          HCTR_OWN_THROW(Error_t::WrongInput, "No such activation: " + act_name);
-        }
-      }
-      // establish out tensor
-      auto output = get_value_from_json<size_t>(j_fc_param, "num_output");
-      dense_layer.num_output = output;
       break;
     }
     case Layer_t::MLP: {
@@ -955,37 +894,45 @@ struct InputOutputInfo {
 };
 
 void Model::add_dense_layers(std::vector<DenseLayer>& dense_layers) {
-  for (auto& dense_layer : dense_layers) {
-    pre_add_dense_layer(dense_layer);
-  }
   auto add_dense_layers_op = [&dense_layers, this](bool is_train) {
-    for (size_t i = 0; i < resource_manager_->get_local_gpu_count(); i++) {
-      std::vector<std::unique_ptr<Layer>> layers;
-      std::map<std::string, std::unique_ptr<ILoss>> losses;
-      metrics::Core23MultiLossMetricMap raw_metrics;
-      std::vector<Layer*> top_layers;
-      std::vector<Layer*> bottom_layers;
-      for (auto& dense_layer : dense_layers) {
+    size_t num_local_gpus = resource_manager_->get_local_gpu_count();
+    std::vector<std::vector<std::unique_ptr<Layer>>> layers(num_local_gpus);
+    std::vector<std::map<std::string, std::unique_ptr<ILoss>>> losses(num_local_gpus);
+    std::vector<metrics::Core23MultiLossMetricMap> raw_metrics(num_local_gpus);
+    std::vector<std::vector<Layer*>> top_layers(num_local_gpus);
+    std::vector<std::vector<Layer*>> bottom_layers(num_local_gpus);
+    for (auto& dense_layer : dense_layers) {
+      if (is_train) {
+        pre_add_dense_layer(dense_layer);
+      }
+      for (size_t i = 0; i < num_local_gpus; i++) {
         add_dense_layer_impl(
             dense_layer,
-            is_train ? train_tensor_entities_list_[i] : evaluate_tensor_entities_list_[i], layers,
-            losses, is_train ? nullptr : &raw_metrics, resource_manager_->get_global_gpu_count(),
-            resource_manager_->get_local_gpu(i), solver_.use_mixed_precision,
-            solver_.enable_tf32_compute, solver_.scaler, solver_.use_algorithm_search,
-            is_train ? &top_layers : nullptr, is_train ? &bottom_layers : nullptr,
-            is_train ? embedding_dependent_ : false, solver_);
+            is_train ? train_tensor_entities_list_[i] : evaluate_tensor_entities_list_[i],
+            layers[i], losses[i], is_train ? nullptr : &raw_metrics[i],
+            resource_manager_->get_global_gpu_count(), resource_manager_->get_local_gpu(i),
+            solver_.use_mixed_precision, solver_.enable_tf32_compute, solver_.scaler,
+            solver_.use_algorithm_search, is_train ? &top_layers[i] : nullptr,
+            is_train ? &bottom_layers[i] : nullptr, is_train ? embedding_dependent_ : false,
+            solver_);
       }
+    }
+    for (size_t i = 0; i < num_local_gpus; i++) {
       if (is_train) {
-        networks_[i]->set_train_layers(std::move(layers));
-        networks_[i]->set_train_losses(std::move(losses), label_weights_);
-        networks_[i]->set_top_and_bottom_layers(std::move(top_layers), std::move(bottom_layers));
+        networks_[i]->set_train_layers(std::move(layers[i]));
+        networks_[i]->set_train_losses(std::move(losses[i]), label_weights_);
+        networks_[i]->set_top_and_bottom_layers(std::move(top_layers[i]),
+                                                std::move(bottom_layers[i]));
       } else {
-        networks_[i]->set_evaluate_layers(std::move(layers));
-        networks_[i]->set_evaluate_losses(std::move(losses), label_weights_);
-        networks_[i]->set_raw_metrics(std::move(raw_metrics));
+        networks_[i]->set_evaluate_layers(std::move(layers[i]));
+        networks_[i]->set_evaluate_losses(std::move(losses[i]), label_weights_);
+        networks_[i]->set_raw_metrics(std::move(raw_metrics[i]));
       }
     }
   };
+
+  add_dense_layers_op(true);
+
   std::unordered_map<NetworkBufferChannelType, std::string> original_channel;
   const std::unordered_map<NetworkBufferChannelType, std::string> new_channel = {
       {NetworkBufferChannelType::Blobs, "EVAL_BLOBS"},
@@ -1007,8 +954,6 @@ void Model::add_dense_layers(std::vector<DenseLayer>& dense_layers) {
   for (auto it = original_channel.begin(); it != original_channel.end(); it++) {
     SetNetworkBufferChannel(it->first, it->second);
   }
-
-  add_dense_layers_op(true);
 }
 
 void calculate_tensor_dimensions(std::map<std::string, std::vector<int>>& tensor_shape_info_raw,
@@ -1089,26 +1034,6 @@ void calculate_tensor_dimensions(std::map<std::string, std::vector<int>>& tensor
       if (dense_layer.top_names.size() == 1) {
         tensor_shape_info_raw.insert(
             std::make_pair(dense_layer.top_names[0], std::vector<int>{batch_size, num_output}));
-      }
-      break;
-    }
-    case Layer_t::FusedInnerProduct: {
-      int batch_size = tensor_shape_info_raw[dense_layer.bottom_names[0]][0];
-      int num_output = dense_layer.num_output;
-      auto pos_type = dense_layer.pos_type;
-      if (pos_type == FcPosition_t::None || pos_type == FcPosition_t::Isolated ||
-          pos_type == FcPosition_t::Tail) {
-        tensor_shape_info_raw.insert(
-            std::make_pair(dense_layer.top_names[0], std::vector<int>{batch_size, num_output}));
-      } else if (pos_type == FcPosition_t::Head || pos_type == FcPosition_t::Body) {
-        tensor_shape_info_raw.insert(
-            std::make_pair(dense_layer.top_names[0], std::vector<int>{batch_size, num_output}));
-        tensor_shape_info_raw.insert(
-            std::make_pair(dense_layer.top_names[1], std::vector<int>{batch_size, num_output}));
-        tensor_shape_info_raw.insert(
-            std::make_pair(dense_layer.top_names[2], std::vector<int>{batch_size, num_output}));
-        tensor_shape_info_raw.insert(
-            std::make_pair(dense_layer.top_names[3], std::vector<int>{1, num_output}));
       }
       break;
     }

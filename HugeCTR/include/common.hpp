@@ -59,7 +59,7 @@
 namespace HugeCTR {
 
 #define HUGECTR_VERSION_MAJOR 23
-#define HUGECTR_VERSION_MINOR 9
+#define HUGECTR_VERSION_MINOR 12
 #define HUGECTR_VERSION_PATCH 0
 
 #define WARP_SIZE 32
@@ -111,8 +111,6 @@ enum class Regularizer_t { L1, L2, None };
 
 enum class Alignment_t { Auto, None };
 
-enum class GroupLayer_t { GroupFusedInnerProduct };
-
 enum class Layer_t {
   BatchNorm,
   LayerNorm,
@@ -124,7 +122,6 @@ enum class Layer_t {
   Dropout,
   ELU,
   InnerProduct,
-  FusedInnerProduct,
   MLP,
   Interaction,
   MultiCrossEntropyLoss,

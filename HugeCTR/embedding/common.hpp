@@ -22,6 +22,7 @@
 #include <core23/tensor_operations.hpp>
 #include <core23/tensor_params.hpp>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -95,13 +96,15 @@ struct DataDistributionInput {
   core23::Tensor h_ptrs_;
   core23::Tensor d_ptrs_;
   int num_lookup_;
+  std::vector<int> dr_lookup_ids_;
   core23::DataType key_type;
   core23::DataType offset_type;
 
   DataDistributionInput() = default;
 
-  DataDistributionInput(std::shared_ptr<core::CoreResourceManager> core, int num_lookup,
-                        core23::DataType key_type, core23::DataType offset_type);
+  DataDistributionInput(std::shared_ptr<core::CoreResourceManager> core,
+                        const std::vector<int> &dr_lookup_ids, core23::DataType key_type,
+                        core23::DataType offset_type);
 
   void copy_tensor_vec(const std::vector<core23::Tensor> &dp_keys,
                        const std::vector<core23::Tensor> &dp_bucket_range, cudaStream_t stream);
@@ -130,6 +133,8 @@ enum class TablePlacementStrategy : int8_t {
   DataParallel,
   ModelParallel,
 };
+enum class CompressionStrategy : int8_t { Reduction, Unique };
+std::ostream &operator<<(std::ostream &os, const CompressionStrategy &p);
 enum class EmbeddingLayout : int8_t { FeatureMajor, BatchMajor };
 std::ostream &operator<<(std::ostream &os, const EmbeddingLayout &p);
 enum class CommunicationStrategy : int8_t { Uniform, Hierarchical };
@@ -140,7 +145,12 @@ enum class KeysPreprocessStrategy : int8_t { None, AddOffset };
 std::ostream &operator<<(std::ostream &os, const KeysPreprocessStrategy &p);
 enum class AllreduceStrategy : int8_t { Dense, GroupDense };
 std::ostream &operator<<(std::ostream &os, const AllreduceStrategy &p);
-enum class EmbeddingType : int8_t { Sparse, Dense };
+enum class EmbeddingGroupType : int8_t {
+  DataParallel,
+  DenseModelParallel,
+  SparseModelParallel,
+  DenseModelParallelWithReduction,
+};
 
 struct LookupParam {
   int lookup_id;
@@ -167,19 +177,31 @@ struct GroupedTableParam {
       : table_placement_strategy(_table_placement_strategy), table_ids(_table_ids) {}
 };
 
+struct CompressionParam {
+  std::unordered_map<CompressionStrategy, std::set<int>> compression_strategy_to_table_ids;
+};
+std::ostream &operator<<(std::ostream &os, const CompressionParam &p);
+
 struct GroupedLookupParam {
   int grouped_table_idx;
-  TablePlacementStrategy table_placement_strategy;
-
   std::vector<int> lookup_ids;
-  EmbeddingType embedding_type;
-  GroupedLookupParam(int table_idx, TablePlacementStrategy tps, const std::vector<int> &lookup_ids,
-                     EmbeddingType embedding_type)
+  EmbeddingGroupType embedding_group_type;
+
+  GroupedLookupParam(int table_idx, const std::vector<int> &lookup_ids,
+                     EmbeddingGroupType embedding_group_type)
       : grouped_table_idx(table_idx),
-        table_placement_strategy(tps),
         lookup_ids(lookup_ids),
-        embedding_type(embedding_type) {}
+        embedding_group_type(embedding_group_type) {}
 };
+
+std::vector<int> filter_dp_lookup_ids(const std::vector<LookupParam> &lookup_params,
+                                      const GroupedTableParam &table_param);
+
+std::vector<int> filter_mp_sparse_lookup_ids(const std::vector<LookupParam> &lookup_params,
+                                             const GroupedTableParam &table_param);
+
+std::vector<int> filter_mp_dense_lookup_ids(const std::vector<LookupParam> &lookup_params,
+                                            const GroupedTableParam &table_param);
 
 struct EmbeddingCollectionParam {
   int num_table;
@@ -214,68 +236,7 @@ struct EmbeddingCollectionParam {
       core23::DataType emb_type, core23::DataType wgrad_type, EmbeddingLayout input_layout_,
       EmbeddingLayout output_layout, SortStrategy sort_strategy,
       KeysPreprocessStrategy keys_preprocess_strategy, AllreduceStrategy allreduce_strategy,
-      CommunicationStrategy comm_strategy)
-      : num_table(num_table),
-        num_lookup(num_lookup),
-        lookup_params(lookup_params),
-        shard_matrix(shard_matrix),
-        grouped_table_params(grouped_table_params),
-        universal_batch_size(universal_batch_size),
-        key_type(key_type),
-        index_type(index_type),
-        offset_type(offset_type),
-        emb_type(emb_type),
-        wgrad_type_(wgrad_type),
-        input_layout_(input_layout_),
-        output_layout_(output_layout),
-        sort_strategy_(sort_strategy),
-        keys_preprocess_strategy_(keys_preprocess_strategy),
-        allreduce_strategy_(allreduce_strategy),
-        comm_strategy_(comm_strategy) {
-    for (size_t grouped_table_id = 0; grouped_table_id < grouped_table_params.size();
-         ++grouped_table_id) {
-      const auto &table_param = grouped_table_params[grouped_table_id];
-
-      std::vector<int> sparse_lookup_ids;
-      std::vector<std::vector<int>> dense_lookup_ids;
-
-      for (int lookup_id = 0; lookup_id < num_lookup; ++lookup_id) {
-        int table_id = lookup_params[lookup_id].table_id;
-        if (std::find(table_param.table_ids.begin(), table_param.table_ids.end(), table_id) ==
-            table_param.table_ids.end())
-          continue;
-        auto combiner = lookup_params[lookup_id].combiner;
-        if (combiner == Combiner::Concat) {
-          int idx = -1;
-          for (int i = 0; i < static_cast<int>(dense_lookup_ids.size()); ++i) {
-            int current_ev_size = this->lookup_params[dense_lookup_ids[i][0]].ev_size;
-            if (current_ev_size == this->lookup_params[lookup_id].ev_size) idx = i;
-          }
-          if (idx == -1) {
-            dense_lookup_ids.push_back({lookup_id});
-          } else {
-            dense_lookup_ids[idx].push_back(lookup_id);
-          }
-        } else if (combiner == Combiner::Sum || combiner == Combiner::Average) {
-          sparse_lookup_ids.push_back(lookup_id);
-        } else {
-          HCTR_OWN_THROW(HugeCTR::Error_t::IllegalCall,
-                         "combiner not supported in embedding collection.");
-        }
-      }
-      if (!sparse_lookup_ids.empty()) {
-        grouped_lookup_params.emplace_back(grouped_table_id, table_param.table_placement_strategy,
-                                           sparse_lookup_ids, EmbeddingType::Sparse);
-      }
-      if (!dense_lookup_ids.empty()) {
-        for (auto &dense_lookup_ids_with_same_ev_size : dense_lookup_ids) {
-          grouped_lookup_params.emplace_back(grouped_table_id, table_param.table_placement_strategy,
-                                             dense_lookup_ids_with_same_ev_size,
-                                             EmbeddingType::Dense);
-        }
-      }
-    }
-  }
+      CommunicationStrategy comm_strategy, CompressionParam compreesion_param);
 
   bool lookup_id_in_group(size_t grouped_id, int lookup_id) const {
     const auto &group_param = this->grouped_lookup_params[grouped_id];
@@ -426,4 +387,7 @@ struct AllreduceWgradInitializer {
   AllreduceWgradInitializer &init_data(bool grouped, const core23::BufferChannel &buffer_channel);
 };
 
+double get_dense_unique_ratio();
+
+double get_wgrad_unique_ratio();
 }  // namespace embedding
